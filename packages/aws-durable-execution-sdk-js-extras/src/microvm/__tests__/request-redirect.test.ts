@@ -20,8 +20,8 @@ const send = (fetchImpl: typeof fetch, endpoint: string, path: string) =>
     log: jest.fn(),
   });
 
-const rejection = (path: string, status: number, location: string): string =>
-  `The MicroVM answered the job at ${path} with HTTP ${status}, a redirect to ${location}. The operation does not follow redirects, so set the path that the route serves.`;
+const rejection = (path: string, status: number, location?: string): string =>
+  `The MicroVM answered the job at ${path} with HTTP ${status}, a redirect${location === undefined ? "" : ` to ${location}`}. The operation does not follow redirects, so set the path that the route serves.`;
 
 describe("sendJob and redirects", () => {
   it.each([301, 302, 303, 307, 308])(
@@ -46,21 +46,44 @@ describe("sendJob and redirects", () => {
     },
   );
 
-  it("rejects a redirect without a Location", async () => {
-    const endpoint = new FakeEndpoint();
-    endpoint.responses = [new Response(null, { status: 302 })];
+  it.each([302, 304])(
+    "names only the status for HTTP %i without a Location",
+    async (status) => {
+      const endpoint = new FakeEndpoint();
+      endpoint.responses = [new Response(null, { status })];
 
-    const error = await send(endpoint.fetch, "mvm-1.example", "/job").catch(
-      (e: unknown) => e,
-    );
+      const error = await send(endpoint.fetch, "mvm-1.example", "/job").catch(
+        (e: unknown) => e,
+      );
 
-    expect(error).toBeInstanceOf(MicrovmRequestRejectedError);
-    expect(error).toMatchObject({
-      status: 302,
-      message: rejection("/job", 302, "no location"),
-    });
-    expect(endpoint.requests).toHaveLength(1);
-  });
+      expect(error).toBeInstanceOf(MicrovmRequestRejectedError);
+      expect(error).toMatchObject({
+        status,
+        message: `The MicroVM answered the job at /job with HTTP ${status}`,
+      });
+      expect(endpoint.requests).toHaveLength(1);
+    },
+  );
+
+  it.each([
+    ["a query and a fragment", "/job/?X-Amz-Signature=secret#top", "/job/"],
+    ["a long path", `/${"a".repeat(300)}`, `/${"a".repeat(199)}...`],
+    ["only a query", "?X-Amz-Signature=secret", undefined],
+  ])(
+    "drops the query and cuts a long Location: %s",
+    async (_label, location, shown) => {
+      const endpoint = new FakeEndpoint();
+      endpoint.responses = [
+        new Response(null, { status: 307, headers: { location } }),
+      ];
+
+      const error = await send(endpoint.fetch, "mvm-1.example", "/job").catch(
+        (e: unknown) => e,
+      );
+
+      expect((error as Error).message).toBe(rejection("/job", 307, shown));
+    },
+  );
 
   describe("with the real fetch", () => {
     let server: Server;
@@ -73,7 +96,7 @@ describe("sendJob and redirects", () => {
         request.resume();
         request.on("end", () =>
           request.url === "/moved"
-            ? response.writeHead(302, { location: "/job" }).end()
+            ? response.writeHead(302, { location: "/job?sig=secret" }).end()
             : response.writeHead(200).end(),
         );
       });
@@ -87,12 +110,32 @@ describe("sendJob and redirects", () => {
       await new Promise<void>((resolve) => server.close(() => resolve()));
     });
 
+    beforeEach(() => {
+      received.length = 0;
+    });
+
     it("does not send the GET that a followed 302 would send", async () => {
       const error = await send(fetch, base, "/moved").catch((e: unknown) => e);
 
       expect(error).toBeInstanceOf(MicrovmRequestRejectedError);
       expect((error as Error).message).toBe(rejection("/moved", 302, "/job"));
       expect(received).toEqual(["POST /moved"]);
+    });
+
+    it("rejects a redirect that a custom fetch follows", async () => {
+      const following: typeof fetch = (input, init) =>
+        fetch(input, { ...init, redirect: "follow" });
+
+      const error = await send(following, base, "/moved").catch(
+        (e: unknown) => e,
+      );
+
+      expect(error).toBeInstanceOf(MicrovmRequestRejectedError);
+      expect(error).toMatchObject({
+        status: 200,
+        message: `The MicroVM answered the job at /moved with a redirect to ${base}/job, and the fetch function followed it. The operation does not follow redirects, so set the path that the route serves, and make the fetch function honor init.redirect.`,
+      });
+      expect(received).toEqual(["POST /moved", "GET /job?sig=secret"]);
     });
   });
 });
