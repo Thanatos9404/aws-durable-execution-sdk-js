@@ -118,8 +118,9 @@ export async function callBeforeDeadline<T>(
 
 /**
  * Thrown when the endpoint rejects the job with a status that a retry cannot
- * change, such as 400 or 404. The default step retry strategy does not retry
- * it.
+ * change, such as 400 or 404. A redirect, 3xx, is rejected too, because the
+ * request step does not follow redirects. The default step retry strategy
+ * does not retry it.
  *
  * @public
  *
@@ -252,6 +253,10 @@ export interface SendJobOptions {
  *   in the same attempt throws {@link MicrovmRequestUnauthorizedError}, and
  *   the step retry strategy takes over.
  * - Any other 4xx: throw {@link MicrovmRequestRejectedError} at once.
+ * - A redirect, 3xx: throw {@link MicrovmRequestRejectedError} at once, with
+ *   the `Location` in the message. A followed 301, 302, or 303 would turn the
+ *   POST into a GET without the job, and a followed redirect to another host
+ *   would receive the auth token.
  *
  * The backoff starts at 250 milliseconds and doubles up to 4 seconds. The
  * tier ends at the retry window, or 10 seconds before the invocation times
@@ -322,6 +327,7 @@ export async function sendJob(options: SendJobOptions): Promise<number> {
       unavailable,
     );
     let status: number | undefined;
+    let location: string | null = null;
     try {
       const response = await options.fetch(url, {
         method: "POST",
@@ -333,9 +339,11 @@ export async function sendJob(options: SendJobOptions): Promise<number> {
           }),
         },
         body: options.body,
+        redirect: "manual",
         signal: AbortSignal.timeout(timeoutMs),
       });
       status = response.status;
+      location = response.headers.get("location");
       // The body is not used. Reading it releases the connection.
       await response.arrayBuffer().catch(() => undefined);
     } catch (error) {
@@ -361,6 +369,12 @@ export async function sendJob(options: SendJobOptions): Promise<number> {
         token = await newToken();
         options.log("auth token refreshed", { attempt, status });
         continue;
+      }
+      if (status >= 300 && status < 400) {
+        throw new MicrovmRequestRejectedError(
+          `The MicroVM answered the job at ${options.path} with HTTP ${status}, a redirect to ${location || "no location"}. The operation does not follow redirects, so set the path that the route serves.`,
+          status,
+        );
       }
       if (
         status >= 400 &&
